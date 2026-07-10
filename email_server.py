@@ -2,6 +2,9 @@ import os
 import smtplib
 from email.message import EmailMessage
 from fastmcp import FastMCP
+from dotenv import load_dotenv
+
+load_dotenv()
 
 #iniatilaise the standalose email server
 mcp = FastMCP("Email-Server")
@@ -29,13 +32,15 @@ def send_email(recipient: str, subject: str, body: str) -> str:
 
     
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(sender_email, sender_password)
+            server.send_message(msg)
+        return f"Success: Email successfully dispatched to {recipient} via SMTP server."
+    except Exception as e:
+        # Intercept any network drops or bad credential rejections cleanly
+        return f"Network Error: Failed to send email due to: {str(e)}"
 
-
-
-    
-
-   
 
 if __name__ == "__main__":
-    # This starts the server locally
     mcp.run()
+
+
