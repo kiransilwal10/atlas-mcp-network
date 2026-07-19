@@ -7,7 +7,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from dotenv import load_dotenv
 
-#load credentials
+# load credentials
 load_dotenv()
 
 app = FastAPI(title="Atlas-MCP-Production-Gateway")
@@ -20,8 +20,10 @@ VENV_PYTHON = os.path.join(BASE_DIR, ".venv", "bin", "python3")
 EMAIL_SERVER_PATH = os.path.join(BASE_DIR, "email_server.py")
 FLIGHT_SERVER_PATH = os.path.join(BASE_DIR, "flight_server.py")
 
+
 class AgentRequest(BaseModel):
     prompt: str
+
 
 async def execute_mcp_tool(server_path: str, tool_name: str, arguments: dict) -> str:
     """
@@ -34,17 +36,16 @@ async def execute_mcp_tool(server_path: str, tool_name: str, arguments: dict) ->
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             response = await session.call_tool(tool_name, arguments=arguments)
-            # Retrieve the raw text result from the MCP JSON-RPC response envelope
             return response.content[0].text
+
 
 @app.post("/agent/chat")
 async def run_ai_agent_loop(request: AgentRequest):
     """
-    Core AI Loop: Takes your conversational request, shares your custom tool blueprints 
-    with Claude, intercepts any tool calls, runs them locally, and returns the final response.
+    Production Agent Loop: Handles single or multi-turn tool calling seamlessly
+    by verifying and executing all tool requests made by Claude in a given turn.
     """
     try:
-        # Define our available tools so Claude knows how to interact with our systems
         available_tools = [
             {
                 "name": "log_flight",
@@ -74,62 +75,74 @@ async def run_ai_agent_loop(request: AgentRequest):
                 }
             }
         ]
-        #first turn: send your natural language prompt and our tool blueprints to claude
-        
-        message = anthropic_client.messages.create(
-            model = "claude-3-5-sonnet-20241022",
-            max_tokens = 1024,
-            tools = available_tools,
-            messages=[{"role": "user", "content": request.prompt}]
-        )
 
-        #check if claude decided that answering this request requires running a tool
-        if message.stop_reason == "tool_use":
-            ## Extract the specific tool call request block from Claude's response
-            tool_use_block = [block for block in message.content if block.type == "tool_use"][0]
-            tool_name = tool_use_block.name
-            tool_args = tool_use_block.input
+        conversation_history = [{"role": "user", "content": request.prompt}]
+        tools_executed = []
 
-            print(f"\n[GATEWAY INTERCEPT] Claude decided to run: '{tool_name}' with parameters: {tool_args}\n")
-
-            # Execute the correct local subprocess based on Claude's decision
-            if tool_name == "log_flight":
-                tool_output = await execute_mcp_tool(FLIGHT_SERVER_PATH, tool_name, tool_args)
-            elif tool_name == "send_email":
-                tool_output = await execute_mcp_tool(EMAIL_SERVER_PATH, tool_name, tool_args)
-            else:
-                raise HTTPException(status_code= 400, detail="Unknown tool requested by model")
-            
-            #second turn; Feed the tool execution output back to Claude so it can formulate its final reply
-            final_response = anthropic_client.messages.create(
-                model = "claude-3-5-sonnet-20241022",
-                max_tokens = 1024,
-                tools = available_tools,
-                messages = [
-                    {"role": "user", "content": request.prompt},
-                    {"role": "assistant", "content": message.content},
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": tool_use_block.id,
-                                "content": tool_output
-                            }
-                        ]
-                    }
-
-                ]
+        while True:
+            # Query Claude using the active production string
+            message = anthropic_client.messages.create(
+                model="claude-sonnet-5",
+                max_tokens=1024,
+                tools=available_tools,
+                messages=conversation_history
             )
-            return {"agent_response": final_response.content[0].text, "tool_executed": tool_name}
-        #if claude didnt need any tools
-        return {"agent_response": message.content[0].text, "tool_executed": "none"}
-    
+
+            # Record Claude's action turn directly into history state
+            conversation_history.append({"role": "assistant", "content": message.content})
+
+            # Base Case: Break out if Claude is done processing tools
+            if message.stop_reason != "tool_use":
+                break
+
+            # Gather all individual tool calls requested in this message turn
+            tool_use_blocks = [block for block in message.content if block.type == "tool_use"]
+            tool_results_content = []
+
+            for tool_use in tool_use_blocks:
+                tool_name = tool_use.name
+                tool_args = tool_use.input
+
+                print(f"\n[LOOP INTERCEPT] Claude executing: '{tool_name}' with parameters: {tool_args}")
+                tools_executed.append(tool_name)
+
+                # Route execution parameters contextually
+                if tool_name == "log_flight":
+                    tool_output = await execute_mcp_tool(FLIGHT_SERVER_PATH, tool_name, tool_args)
+                elif tool_name == "send_email":
+                    tool_output = await execute_mcp_tool(EMAIL_SERVER_PATH, tool_name, tool_args)
+                else:
+                    raise HTTPException(status_code=400, detail="Unknown tool requested by model")
+
+                # Accumulate the response inside a tool_result block
+                tool_results_content.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use.id,
+                    "content": tool_output
+                })
+
+            # Feed the complete answer block array back as a single user interaction
+            conversation_history.append({
+                "role": "user",
+                "content": tool_results_content
+            })
+
+        # Safely capture string text fields out of final assistant payload
+        final_text = ""
+        for block in conversation_history[-1]["content"]:
+            if hasattr(block, 'text'):
+                final_text = block.text
+                break
+
+        return {
+            "agent_response": final_text,
+            "pipeline_steps": tools_executed
+        }
+
     except Exception as e:
-        raise HTTPException(status_code = 500, detail=f"Agent Pipeline Crash: {str(e)}")
-    
+        raise HTTPException(status_code=500, detail=f"Agent Loop failure: {str(e)}")
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("gateway:app", host = "127.0.0.1", port =8000, reload = True)
-
-
+    uvicorn.run("gateway:app", host="127.0.0.1", port=8000, reload=True)
