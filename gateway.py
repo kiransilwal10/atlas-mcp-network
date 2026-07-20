@@ -1,5 +1,6 @@
 import os
 import asyncio
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from anthropic import Anthropic
@@ -11,6 +12,84 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI(title="Atlas-MCP-Production-Gateway")
+
+#global in-memory draft staging store
+pending_actions = {}
+
+#pydantic request models
+class EmailDraftRequest(BaseModel):
+    recipient: str
+    subject: str
+    body: str
+    session_id: str = "default_user"
+
+class ConfirmationRequest(BaseModel):
+    session_id: str = "default_user"
+    confirmation: bool
+    corrected_email: Optional[str] = None
+
+#stage email draft endpoint
+@app.post("/agent/stage_email")
+async def stage_email_draft(req: EmailDraftRequest):
+    """
+    stages an email draft instead of sending it directly
+    """
+    pending_actions[req.session_id] = {
+    
+        "action": "send_email",
+        "params": {
+            "recipient": req.recipient,
+            "subject": req.subject,
+            "body": req.body
+
+        }
+    }
+    return {
+        "status": "pending_confirmation",
+        "message": f"I've prepared the draft to {req.recipient}. Should I send it, or would you like to correct the recipient?"
+    }
+
+#execution endpoint which is called after user confirms verbally
+@app.post("/agent/confirm_action")
+async def confirm_and_execute(req: ConfirmationRequest):
+    """
+    Executes or updates the action after user verification
+    """
+    draft = pending_actions.get(req.session_id)
+    if not draft:
+        return {"status": "error", "message": "No pending action found."}
+    
+    #user correctd the transcibed email verbally
+    if req.corrected_email:
+        draft["params"]["recipient"] = req.corrected_email
+        return{
+            "status": "updated",
+            "message": f"Updated recipient to {req.corrected_email}. Confirm to send now?"
+        }
+    #user said "yes" -> execute the staged action via the MCP email server
+    if req.confirmation:
+        try:
+            tool_output = await execute_mcp_tool(
+                EMAIL_SERVER_PATH,
+                draft["action"],
+                draft["params"]
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Action execution failed: {str(e)}")
+
+        #clear the staged draft now that it has been sent
+        pending_actions.pop(req.session_id, None)
+
+        return {
+            "status": "sent",
+            "message": f"Email sent to {draft['params']['recipient']}.",
+            "tool_output": tool_output
+        }
+
+    #user declined -> discard the staged draft
+    pending_actions.pop(req.session_id, None)
+    return {"status": "cancelled", "message": "Okay, I've discarded the draft."}
+
 
 anthropic_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
