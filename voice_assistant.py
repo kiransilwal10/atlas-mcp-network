@@ -41,13 +41,15 @@ def speak_response(text):
     """
     take claude's text answer and convert it into high-quality spoken audio
     """
+    if not text:
+        return
+    
     try:
         print("Generating voice response...")
-        audio = eleven_client.generate(
+        audio = eleven_client.text_to_speech.convert(
             text = text,
-            voice="Rachel",
-            model="eleven_monolingual_v1"
-
+            voice_id="JBFqnCBsd6RMkjVDRZzb",  
+            model_id="eleven_multilingual_v2"
         )
         play(audio)
     except Exception as e:
